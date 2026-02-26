@@ -4,7 +4,7 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { CURRENT_SESSION_VERSION } from "@mariozechner/pi-coding-agent";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { resolveThinkingDefault } from "../../agents/model-selection.js";
-import { repairToolUseResultPairing } from "../../agents/session-transcript-repair.js";
+import { stripOrphanedToolResults } from "../../agents/session-transcript-repair.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import { dispatchInboundMessage } from "../../auto-reply/dispatch.js";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
@@ -557,14 +557,16 @@ export const chatHandlers: GatewayRequestHandlers = {
     const requested = typeof limit === "number" ? limit : defaultLimit;
     const max = Math.min(hardMax, requested);
     const sanitized = stripEnvelopeFromMessages(rawMessages);
-    // Repair tool_use/tool_result pairing BEFORE slicing to prevent false positives.
-    // If we slice first and the slice boundary starts on a toolResult whose matching
-    // assistant toolCall is just outside the window, repairToolUseResultPairing would
-    // incorrectly classify it as orphaned and drop it.
+    // Strip orphaned tool_result messages (those without matching tool_use) BEFORE slicing.
+    // This prevents "unexpected tool_use_id" errors from orphaned tool_results after compaction.
+    // We use stripOrphanedToolResults instead of repairToolUseResultPairing to avoid fabricating
+    // synthetic error results for in-flight tool calls (where assistant emitted tool_use but
+    // tool_result hasn't been persisted yet). Fabricating errors mid-run would cause clients
+    // to cache/display false failures.
     // See: https://github.com/openclaw/openclaw/issues/27804
-    const repaired = repairToolUseResultPairing(sanitized as AgentMessage[]);
+    const stripped = stripOrphanedToolResults(sanitized as AgentMessage[]);
     const sliced =
-      repaired.messages.length > max ? repaired.messages.slice(-max) : repaired.messages;
+      stripped.messages.length > max ? stripped.messages.slice(-max) : stripped.messages;
     const normalized = sanitizeChatHistoryMessages(sliced);
     const maxHistoryBytes = getMaxChatHistoryMessagesBytes();
     const perMessageHardCap = Math.min(CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES, maxHistoryBytes);

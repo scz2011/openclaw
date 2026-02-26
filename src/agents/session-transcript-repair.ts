@@ -93,6 +93,67 @@ function makeMissingToolResult(params: {
 
 export { makeMissingToolResult };
 
+/**
+ * Strip orphaned tool_result messages (those without a matching tool_use in the preceding
+ * assistant message) from the transcript. This is a read-only operation that does NOT
+ * fabricate synthetic error results for missing tool_results.
+ *
+ * Use this in chat.history to prevent "unexpected tool_use_id" errors from orphaned
+ * tool_results after compaction, without creating false error messages for in-flight
+ * tool calls that haven't persisted their results yet.
+ *
+ * For full transcript repair (including synthetic error results for missing tool_results),
+ * use repairToolUseResultPairing instead.
+ */
+export function stripOrphanedToolResults(messages: AgentMessage[]): {
+  messages: AgentMessage[];
+  droppedOrphanCount: number;
+} {
+  const out: AgentMessage[] = [];
+  let droppedOrphanCount = 0;
+  const seenToolCallIds = new Set<string>();
+
+  for (let i = 0; i < messages.length; i += 1) {
+    const msg = messages[i];
+    if (!msg || typeof msg !== "object") {
+      out.push(msg);
+      continue;
+    }
+
+    const role = (msg as { role?: unknown }).role;
+
+    // Track tool call IDs from assistant messages
+    if (role === "assistant") {
+      const assistant = msg as Extract<AgentMessage, { role: "assistant" }>;
+      const toolCalls = extractToolCallsFromAssistant(assistant);
+      for (const call of toolCalls) {
+        seenToolCallIds.add(call.id);
+      }
+      out.push(msg);
+      continue;
+    }
+
+    // Drop orphaned tool_result messages (those without a matching tool_use)
+    if (role === "toolResult") {
+      const toolResult = msg as Extract<AgentMessage, { role: "toolResult" }>;
+      const id = extractToolResultId(toolResult);
+      if (id && seenToolCallIds.has(id)) {
+        out.push(msg);
+      } else {
+        droppedOrphanCount += 1;
+      }
+      continue;
+    }
+
+    out.push(msg);
+  }
+
+  return {
+    messages: droppedOrphanCount > 0 ? out : messages,
+    droppedOrphanCount,
+  };
+}
+
 export type ToolCallInputRepairReport = {
   messages: AgentMessage[];
   droppedToolCalls: number;

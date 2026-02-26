@@ -4,6 +4,7 @@ import {
   sanitizeToolCallInputs,
   sanitizeToolUseResultPairing,
   repairToolUseResultPairing,
+  stripOrphanedToolResults,
 } from "./session-transcript-repair.js";
 
 const TOOL_CALL_BLOCK_TYPES = new Set(["toolCall", "toolUse", "functionCall"]);
@@ -313,5 +314,119 @@ describe("sanitizeToolCallInputs", () => {
       ? assistant.content.map((block) => (block as { type?: unknown }).type)
       : [];
     expect(types).toEqual(["text", "toolUse"]);
+  });
+});
+
+describe("stripOrphanedToolResults", () => {
+  it("drops orphaned tool_result messages without matching tool_use", () => {
+    const input = [
+      { role: "user", content: "hello" },
+      {
+        role: "toolResult",
+        toolCallId: "call_orphan",
+        toolName: "read",
+        content: [{ type: "text", text: "orphan result" }],
+        isError: false,
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "ok" }],
+      },
+    ] as unknown as AgentMessage[];
+
+    const result = stripOrphanedToolResults(input);
+
+    expect(result.droppedOrphanCount).toBe(1);
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]?.role).toBe("user");
+    expect(result.messages[1]?.role).toBe("assistant");
+  });
+
+  it("keeps tool_result messages that have matching tool_use", () => {
+    const input = [
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_1", name: "read", arguments: {} }],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        toolName: "read",
+        content: [{ type: "text", text: "result" }],
+        isError: false,
+      },
+      { role: "user", content: "ok" },
+    ] as unknown as AgentMessage[];
+
+    const result = stripOrphanedToolResults(input);
+
+    expect(result.droppedOrphanCount).toBe(0);
+    expect(result.messages).toHaveLength(3);
+    expect(result.messages[1]?.role).toBe("toolResult");
+  });
+
+  it("does NOT fabricate synthetic error results for missing tool_results", () => {
+    // This is the key difference from repairToolUseResultPairing:
+    // stripOrphanedToolResults does NOT create synthetic error results for
+    // in-flight tool calls (where assistant emitted tool_use but tool_result
+    // hasn't been persisted yet).
+    const input = [
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_inflight", name: "exec", arguments: {} }],
+      },
+      { role: "user", content: "waiting for result..." },
+    ] as unknown as AgentMessage[];
+
+    const result = stripOrphanedToolResults(input);
+
+    // Should NOT add any messages
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]?.role).toBe("assistant");
+    expect(result.messages[1]?.role).toBe("user");
+    // Should NOT drop anything
+    expect(result.droppedOrphanCount).toBe(0);
+  });
+
+  it("handles mixed scenario: keeps valid results, drops orphans, ignores missing", () => {
+    const input = [
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_1", name: "read", arguments: {} },
+          { type: "toolCall", id: "call_2", name: "exec", arguments: {} },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        toolName: "read",
+        content: [{ type: "text", text: "result 1" }],
+        isError: false,
+      },
+      // call_2 result is missing (in-flight) - should NOT fabricate error
+      { role: "user", content: "user message" },
+      {
+        role: "toolResult",
+        toolCallId: "call_orphan",
+        toolName: "write",
+        content: [{ type: "text", text: "orphan" }],
+        isError: false,
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "done" }],
+      },
+    ] as unknown as AgentMessage[];
+
+    const result = stripOrphanedToolResults(input);
+
+    expect(result.droppedOrphanCount).toBe(1); // Only the orphan is dropped
+    expect(result.messages).toHaveLength(4);
+    expect(result.messages[0]?.role).toBe("assistant");
+    expect(result.messages[1]?.role).toBe("toolResult");
+    expect((result.messages[1] as { toolCallId?: string }).toolCallId).toBe("call_1");
+    expect(result.messages[2]?.role).toBe("user");
+    expect(result.messages[3]?.role).toBe("assistant");
   });
 });
